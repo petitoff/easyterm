@@ -67,6 +67,16 @@ impl Grid {
         self.cells.get_mut(row * self.width + col)
     }
 
+    pub fn row(&self, row: usize) -> Option<&[Cell]> {
+        if row >= self.height {
+            return None;
+        }
+
+        let start = row * self.width;
+        let end = start + self.width;
+        Some(&self.cells[start..end])
+    }
+
     pub fn clear(&mut self) {
         self.cells.fill(Cell::default());
     }
@@ -132,19 +142,21 @@ impl Grid {
     }
 
     pub fn row_text(&self, row: usize) -> String {
-        let mut out = String::new();
-        for col in 0..self.width {
-            if let Some(cell) = self.get(row, col) {
-                if !cell.wide_continuation {
-                    out.push_str(&cell.text);
-                }
-            }
-        }
-        out.trim_end().to_string()
+        self.row(row).map(Self::cells_text).unwrap_or_default()
     }
 
     pub fn snapshot(&self) -> Vec<String> {
         (0..self.height).map(|row| self.row_text(row)).collect()
+    }
+
+    pub fn cells_text(cells: &[Cell]) -> String {
+        let mut out = String::new();
+        for cell in cells {
+            if !cell.wide_continuation {
+                out.push_str(&cell.text);
+            }
+        }
+        out.trim_end().to_string()
     }
 }
 

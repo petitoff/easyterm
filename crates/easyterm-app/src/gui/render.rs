@@ -1,5 +1,5 @@
 use crate::gui::canvas::Canvas;
-use crate::gui::font::FontRenderer;
+use crate::gui::font::{FontRenderer, TextStyle};
 use crate::gui::tab::{CellPoint, GuiTab};
 use crate::pty::PtySize;
 use easyterm_core::{Cell, Color, Cursor};
@@ -145,44 +145,44 @@ impl RendererState {
         let cols = tab.terminal().grid().width();
         let rows = tab.terminal().grid().height();
         let viewport_start = tab.viewport_start(rows);
-        let scrollback = tab.terminal().view_scrollback();
-        let current_start = scrollback.len();
+        let scrollback_len = tab.terminal().view_scrollback().len();
 
         for row in 0..rows {
             let global_row = viewport_start + row;
             let y = self.tab_height + row * self.font.cell_height();
             for col in 0..cols {
                 let x = col * self.font.cell_width();
-                let mut bg = rgb(14, 16, 20);
-                let mut fg = rgb(224, 229, 236);
-                let mut ch = ' ';
-                let mut underline = false;
+                let mut attrs = ResolvedCell::default();
 
-                if global_row < current_start {
-                    if let Some(value) = scrollback[global_row].chars().nth(col) {
-                        ch = value;
-                    }
-                } else {
-                    let grid_row = global_row - current_start;
-                    if let Some(cell) = tab.terminal().grid().get(grid_row, col) {
-                        ch = renderable_cell(cell);
-                        fg = resolve_fg(cell);
-                        bg = resolve_bg(cell);
-                        underline = cell.style.underline;
-                    }
+                if let Some(cell) = cell_at(tab, global_row, scrollback_len, col) {
+                    attrs = resolve_cell(cell);
                 }
 
                 if tab.allows_local_selection()
                     && tab.selection_contains(CellPoint { global_row, col })
                 {
-                    bg = rgb(52, 78, 116);
+                    attrs.bg = rgb(52, 78, 116);
                 }
 
-                canvas.fill_rect(x, y, self.font.cell_width(), self.font.cell_height(), bg);
-                if ch != ' ' {
-                    self.font.draw_char(canvas, x, y, ch, fg, Some(bg));
+                canvas.fill_rect(
+                    x,
+                    y,
+                    self.font.cell_width(),
+                    self.font.cell_height(),
+                    attrs.bg,
+                );
+                if attrs.ch != ' ' && !attrs.hidden {
+                    self.font.draw_char(
+                        canvas,
+                        x,
+                        y,
+                        attrs.ch,
+                        attrs.fg,
+                        Some(attrs.bg),
+                        attrs.style,
+                    );
                 }
-                if underline {
+                if attrs.underline {
                     canvas.fill_rect(
                         x,
                         y + self
@@ -191,7 +191,7 @@ impl RendererState {
                             .saturating_sub(self.font.underline_thickness()),
                         self.font.cell_width(),
                         self.font.underline_thickness(),
-                        fg,
+                        attrs.fg,
                     );
                 }
             }
@@ -225,7 +225,8 @@ impl RendererState {
     ) {
         let mut pen_x = x;
         for ch in text.chars() {
-            self.font.draw_char(canvas, pen_x, y, ch, fg, bg);
+            self.font
+                .draw_char(canvas, pen_x, y, ch, fg, bg, TextStyle::default());
             pen_x += self.font.text_step(ch);
         }
     }
@@ -244,12 +245,66 @@ fn renderable_cell(cell: &Cell) -> char {
     cell.text.chars().next().unwrap_or(' ')
 }
 
-fn resolve_fg(cell: &Cell) -> u32 {
-    resolve_color(cell.style.fg, rgb(224, 229, 236))
+fn cell_at(tab: &GuiTab, global_row: usize, scrollback_len: usize, col: usize) -> Option<&Cell> {
+    if global_row < scrollback_len {
+        return tab.terminal().scrollback_row(global_row)?.get(col);
+    }
+
+    let grid_row = global_row.checked_sub(scrollback_len)?;
+    tab.terminal().grid().get(grid_row, col)
 }
 
-fn resolve_bg(cell: &Cell) -> u32 {
-    resolve_color(cell.style.bg, rgb(14, 16, 20))
+#[derive(Clone, Copy)]
+struct ResolvedCell {
+    ch: char,
+    fg: u32,
+    bg: u32,
+    underline: bool,
+    hidden: bool,
+    style: TextStyle,
+}
+
+impl Default for ResolvedCell {
+    fn default() -> Self {
+        Self {
+            ch: ' ',
+            fg: rgb(224, 229, 236),
+            bg: rgb(14, 16, 20),
+            underline: false,
+            hidden: false,
+            style: TextStyle::default(),
+        }
+    }
+}
+
+fn resolve_cell(cell: &Cell) -> ResolvedCell {
+    let mut fg = resolve_color(cell.style.fg, rgb(224, 229, 236));
+    let mut bg = resolve_color(cell.style.bg, rgb(14, 16, 20));
+
+    if cell.style.bold {
+        fg = brighten_color(fg);
+    }
+    if cell.style.dim {
+        fg = dim_color(fg, bg);
+    }
+    if cell.style.inverse {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if cell.style.hidden {
+        fg = bg;
+    }
+
+    ResolvedCell {
+        ch: renderable_cell(cell),
+        fg,
+        bg,
+        underline: cell.style.underline,
+        hidden: cell.style.hidden,
+        style: TextStyle {
+            bold: cell.style.bold,
+            italic: cell.style.italic,
+        },
+    }
 }
 
 fn resolve_color(color: Color, default: u32) -> u32 {
@@ -258,6 +313,20 @@ fn resolve_color(color: Color, default: u32) -> u32 {
         Color::Rgb(r, g, b) => rgb(r, g, b),
         Color::Indexed(value) => indexed_color(value),
     }
+}
+
+fn brighten_color(color: u32) -> u32 {
+    transform_rgb(color, |component| component.saturating_add(32))
+}
+
+fn dim_color(color: u32, bg: u32) -> u32 {
+    let (fg_r, fg_g, fg_b) = split_rgb(color);
+    let (bg_r, bg_g, bg_b) = split_rgb(bg);
+    rgb(
+        ((fg_r as u16 * 2 + bg_r as u16) / 3) as u8,
+        ((fg_g as u16 * 2 + bg_g as u16) / 3) as u8,
+        ((fg_b as u16 * 2 + bg_b as u16) / 3) as u8,
+    )
 }
 
 fn indexed_color(index: u8) -> u32 {
@@ -308,4 +377,17 @@ fn component_6cube(value: u8) -> u8 {
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
+
+fn split_rgb(color: u32) -> (u8, u8, u8) {
+    (
+        ((color >> 16) & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        (color & 0xff) as u8,
+    )
+}
+
+fn transform_rgb(color: u32, map: impl Fn(u8) -> u8) -> u32 {
+    let (r, g, b) = split_rgb(color);
+    rgb(map(r), map(g), map(b))
 }

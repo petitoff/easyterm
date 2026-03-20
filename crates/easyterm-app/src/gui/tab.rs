@@ -1,6 +1,6 @@
 use crate::pty::{spawn_local_runtime, LocalPtyError, PtyRuntime, PtySize};
 use crate::session::LocalSessionSpec;
-use easyterm_core::{MouseReportingMode, Terminal, TerminalModes};
+use easyterm_core::{Grid, MouseReportingMode, Terminal, TerminalModes};
 use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::process::ExitStatus;
@@ -76,20 +76,35 @@ impl GuiTab {
         self.runtime.resize(size)
     }
 
-    pub(crate) fn drain_output(&mut self) {
+    pub(crate) fn drain_output(&mut self) -> bool {
+        let mut changed = false;
         for chunk in self.runtime.drain_output() {
             self.terminal.feed(&chunk);
+            changed = true;
         }
 
         if !self.allows_local_scrollback() {
+            if self.scroll_offset != 0
+                || self.selection_anchor.is_some()
+                || self.selection_focus.is_some()
+            {
+                changed = true;
+            }
             self.scroll_offset = 0;
             self.clear_selection();
         } else if self.terminal.scrollback().len() > self.scrollback_limit {
+            let removed = self.terminal.trim_scrollback(self.scrollback_limit);
+            if removed > 0 {
+                changed = true;
+                self.clear_selection();
+            }
             self.scroll_offset = min(
                 self.scroll_offset,
                 self.max_scroll_offset(self.terminal.grid().height()),
             );
         }
+
+        changed
     }
 
     pub(crate) fn refresh_exit_state(&mut self) -> Result<(), LocalPtyError> {
@@ -216,7 +231,7 @@ impl GuiTab {
     fn line_text(&self, global_row: usize) -> Option<String> {
         let scrollback = self.terminal.view_scrollback();
         if global_row < scrollback.len() {
-            return Some(scrollback[global_row].clone());
+            return Some(Grid::cells_text(&scrollback[global_row]));
         }
 
         let grid_row = global_row.checked_sub(scrollback.len())?;
@@ -224,7 +239,7 @@ impl GuiTab {
             return None;
         }
 
-        Some(self.terminal.grid().row_text(grid_row))
+        self.terminal.grid().row(grid_row).map(Grid::cells_text)
     }
 
     pub(crate) fn allows_local_scrollback(&self) -> bool {

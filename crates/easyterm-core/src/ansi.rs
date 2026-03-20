@@ -12,8 +12,11 @@ pub struct Style {
     pub fg: Color,
     pub bg: Color,
     pub bold: bool,
+    pub dim: bool,
     pub italic: bool,
     pub underline: bool,
+    pub inverse: bool,
+    pub hidden: bool,
 }
 
 impl Default for Style {
@@ -22,8 +25,11 @@ impl Default for Style {
             fg: Color::Default,
             bg: Color::Default,
             bold: false,
+            dim: false,
             italic: false,
             underline: false,
+            inverse: false,
+            hidden: false,
         }
     }
 }
@@ -61,6 +67,7 @@ pub enum AnsiEvent {
     CursorDown(u16),
     CursorForward(u16),
     CursorBackward(u16),
+    CursorHorizontalAbsolute(u16),
     CursorPosition {
         row: u16,
         col: u16,
@@ -69,6 +76,9 @@ pub enum AnsiEvent {
         top: Option<u16>,
         bottom: Option<u16>,
     },
+    InsertBlankChars(u16),
+    DeleteChars(u16),
+    EraseChars(u16),
     InsertLines(u16),
     DeleteLines(u16),
     ClearLine(ClearMode),
@@ -82,6 +92,10 @@ pub enum AnsiEvent {
 }
 
 pub fn parse_ansi(input: &[u8]) -> Vec<AnsiEvent> {
+    parse_ansi_stream(input).0
+}
+
+pub fn parse_ansi_stream(input: &[u8]) -> (Vec<AnsiEvent>, usize) {
     let mut events = Vec::new();
     let mut i = 0;
 
@@ -100,11 +114,15 @@ pub fn parse_ansi(input: &[u8]) -> Vec<AnsiEvent> {
                 i += 1;
             }
             0x1b => {
-                if i + 1 < input.len() && input[i + 1] == b'[' {
+                if i + 1 >= input.len() {
+                    break;
+                }
+
+                if input[i + 1] == b'[' {
                     let mut j = i + 2;
                     while j < input.len() {
                         let byte = input[j];
-                        if (byte as char).is_ascii_alphabetic() {
+                        if (0x40..=0x7e).contains(&byte) {
                             break;
                         }
                         j += 1;
@@ -118,7 +136,7 @@ pub fn parse_ansi(input: &[u8]) -> Vec<AnsiEvent> {
                     } else {
                         break;
                     }
-                } else if i + 1 < input.len() && input[i + 1] == b']' {
+                } else if input[i + 1] == b']' {
                     if let Some((event, next_i)) = parse_osc_sequence(input, i + 2) {
                         if let Some(event) = event {
                             events.push(event);
@@ -133,7 +151,7 @@ pub fn parse_ansi(input: &[u8]) -> Vec<AnsiEvent> {
                     }
                     i = next_i;
                 } else {
-                    i += 1;
+                    break;
                 }
             }
             byte => {
@@ -141,6 +159,8 @@ pub fn parse_ansi(input: &[u8]) -> Vec<AnsiEvent> {
                     let len = ch.len_utf8();
                     events.push(AnsiEvent::Print(ch));
                     i += len;
+                } else if utf8_sequence_incomplete(&input[i..]) {
+                    break;
                 } else {
                     events.push(AnsiEvent::Print(byte as char));
                     i += 1;
@@ -149,7 +169,7 @@ pub fn parse_ansi(input: &[u8]) -> Vec<AnsiEvent> {
         }
     }
 
-    events
+    (events, i)
 }
 
 fn parse_numbers(params: &str) -> Vec<u16> {
@@ -172,11 +192,15 @@ fn decode_csi(final_byte: char, params: &str, events: &mut Vec<AnsiEvent>) {
         'B' => events.push(AnsiEvent::CursorDown(first_or(&numbers, 1))),
         'C' => events.push(AnsiEvent::CursorForward(first_or(&numbers, 1))),
         'D' => events.push(AnsiEvent::CursorBackward(first_or(&numbers, 1))),
+        'G' => events.push(AnsiEvent::CursorHorizontalAbsolute(first_or(&numbers, 1))),
         'H' | 'f' => {
             let row = *numbers.first().unwrap_or(&1);
             let col = *numbers.get(1).unwrap_or(&1);
             events.push(AnsiEvent::CursorPosition { row, col });
         }
+        '@' => events.push(AnsiEvent::InsertBlankChars(first_or(&numbers, 1))),
+        'P' => events.push(AnsiEvent::DeleteChars(first_or(&numbers, 1))),
+        'X' => events.push(AnsiEvent::EraseChars(first_or(&numbers, 1))),
         'L' => events.push(AnsiEvent::InsertLines(first_or(&numbers, 1))),
         'M' => events.push(AnsiEvent::DeleteLines(first_or(&numbers, 1))),
         'J' => events.push(AnsiEvent::ClearScreen(parse_clear_mode(first_or(
@@ -196,6 +220,8 @@ fn decode_csi(final_byte: char, params: &str, events: &mut Vec<AnsiEvent>) {
                 events.push(AnsiEvent::SetStyle(numbers));
             }
         }
+        's' => events.push(AnsiEvent::SaveCursor),
+        'u' if private.is_none() => events.push(AnsiEvent::RestoreCursor),
         'h' | 'l' if private.is_some() => {
             let enabled = final_byte == 'h';
             for number in numbers {
@@ -251,6 +277,22 @@ fn decode_utf8_char(bytes: &[u8]) -> Option<char> {
     None
 }
 
+fn utf8_sequence_incomplete(bytes: &[u8]) -> bool {
+    let Some(&first) = bytes.first() else {
+        return false;
+    };
+
+    let expected_len = match first {
+        0x00..=0x7f => return false,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => return false,
+    };
+
+    bytes.len() < expected_len
+}
+
 fn parse_osc_sequence(input: &[u8], start: usize) -> Option<(Option<AnsiEvent>, usize)> {
     let mut end = start;
     while end < input.len() {
@@ -295,15 +337,19 @@ fn parse_escape_sequence(input: &[u8], start: usize) -> Option<(Option<AnsiEvent
             return None;
         }
         b'=' | b'>' => None,
-        _ => None,
+        _ => return Some((None, next_i)),
     };
 
-    Some((event, next_i))
+    if matches!(byte, b'=' | b'>') {
+        Some((None, next_i))
+    } else {
+        Some((event, next_i))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_ansi, AnsiEvent, ClearMode, Color, DecMode, Style};
+    use super::{parse_ansi, parse_ansi_stream, AnsiEvent, ClearMode, Color, DecMode, Style};
 
     #[test]
     fn parses_text_and_control_flow() {
@@ -380,10 +426,16 @@ mod tests {
 
     #[test]
     fn parses_scroll_region_and_line_ops() {
-        let events = parse_ansi(b"\x1b[2;5r\x1b[2L\x1b[3M");
+        let events = parse_ansi(b"\x1b[7G\x1b[3@\x1b[4P\x1b[5X\x1b[s\x1b[u\x1b[2;5r\x1b[2L\x1b[3M");
         assert_eq!(
             events,
             vec![
+                AnsiEvent::CursorHorizontalAbsolute(7),
+                AnsiEvent::InsertBlankChars(3),
+                AnsiEvent::DeleteChars(4),
+                AnsiEvent::EraseChars(5),
+                AnsiEvent::SaveCursor,
+                AnsiEvent::RestoreCursor,
                 AnsiEvent::SetScrollRegion {
                     top: Some(2),
                     bottom: Some(5),
@@ -424,9 +476,26 @@ mod tests {
                 fg: Color::Default,
                 bg: Color::Default,
                 bold: false,
+                dim: false,
                 italic: false,
                 underline: false,
+                inverse: false,
+                hidden: false,
             }
         );
+    }
+
+    #[test]
+    fn preserves_incomplete_csi_for_next_chunk() {
+        let (events, consumed) = parse_ansi_stream(b"\x1b[67");
+        assert!(events.is_empty());
+        assert_eq!(consumed, 0);
+    }
+
+    #[test]
+    fn preserves_incomplete_utf8_for_next_chunk() {
+        let (events, consumed) = parse_ansi_stream(&[0xe2, 0x94]);
+        assert!(events.is_empty());
+        assert_eq!(consumed, 0);
     }
 }

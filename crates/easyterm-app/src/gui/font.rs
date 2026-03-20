@@ -12,6 +12,12 @@ pub(crate) struct FontRenderer {
     cell_height: usize,
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TextStyle {
+    pub(crate) bold: bool,
+    pub(crate) italic: bool,
+}
+
 impl FontRenderer {
     pub(crate) fn new(font_size: u16, family: &str) -> Self {
         let backend = load_outline_font(family, font_size).unwrap_or_else(|| {
@@ -47,6 +53,7 @@ impl FontRenderer {
         ch: char,
         fg: u32,
         bg: Option<u32>,
+        style: TextStyle,
     ) {
         match &self.backend {
             FontBackend::Outline(outline) => {
@@ -62,9 +69,18 @@ impl FontRenderer {
                         if alpha == 0 {
                             continue;
                         }
-                        let target_x = x as isize + glyph.offset_x + px as isize;
+                        let italic_slant = if style.italic {
+                            italic_offset(py, glyph.height)
+                        } else {
+                            0
+                        };
+                        let target_x =
+                            x as isize + glyph.offset_x + px as isize + italic_slant as isize;
                         let target_y = y as isize + glyph.offset_y + py as isize;
                         canvas.blend_pixel(target_x, target_y, fg, alpha);
+                        if style.bold {
+                            canvas.blend_pixel(target_x + 1, target_y, fg, alpha);
+                        }
                     }
                 }
             }
@@ -82,9 +98,14 @@ impl FontRenderer {
                         if bits & (1 << col) == 0 {
                             continue;
                         }
-                        let px = x + col as usize * glyph_scale;
+                        let px = x
+                            + col as usize * glyph_scale
+                            + italic_offset(row, bitmap.len()) * glyph_scale;
                         let py = y + row * glyph_scale;
                         canvas.fill_rect(px, py, *glyph_scale, *glyph_scale, fg);
+                        if style.bold {
+                            canvas.fill_rect(px + 1, py, *glyph_scale, *glyph_scale, fg);
+                        }
                     }
                 }
             }
@@ -218,6 +239,10 @@ fn load_outline_font(family: &str, size: u16) -> Option<FontBackend> {
     }
 
     None
+}
+
+fn italic_offset(row: usize, total_rows: usize) -> usize {
+    total_rows.saturating_sub(row.saturating_add(1)).min(3) / 2
 }
 
 fn font_candidates(family: &str) -> Vec<PathBuf> {

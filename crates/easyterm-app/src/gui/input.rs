@@ -1,7 +1,7 @@
 use crate::gui::tab::CellPoint;
 use easyterm_core::{MouseReportingMode, TerminalModes};
 use winit::event::MouseButton;
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
 pub(crate) fn named_key_bytes(key: &Key, modes: TerminalModes) -> Option<Vec<u8>> {
     match key {
@@ -43,8 +43,49 @@ pub(crate) fn named_key_bytes(key: &Key, modes: TerminalModes) -> Option<Vec<u8>
     }
 }
 
+pub(crate) fn physical_key_bytes(key: &PhysicalKey, modes: TerminalModes) -> Option<Vec<u8>> {
+    match key {
+        PhysicalKey::Code(KeyCode::Enter) => Some(b"\r".to_vec()),
+        PhysicalKey::Code(KeyCode::Tab) => Some(b"\t".to_vec()),
+        PhysicalKey::Code(KeyCode::Backspace) => Some(b"\x7f".to_vec()),
+        PhysicalKey::Code(KeyCode::Escape) => Some(b"\x1b".to_vec()),
+        PhysicalKey::Code(KeyCode::ArrowUp) => Some(cursor_sequence('A', modes)),
+        PhysicalKey::Code(KeyCode::ArrowDown) => Some(cursor_sequence('B', modes)),
+        PhysicalKey::Code(KeyCode::ArrowRight) => Some(cursor_sequence('C', modes)),
+        PhysicalKey::Code(KeyCode::ArrowLeft) => Some(cursor_sequence('D', modes)),
+        PhysicalKey::Code(KeyCode::Home) => Some(if modes.application_cursor_keys {
+            b"\x1bOH".to_vec()
+        } else {
+            b"\x1b[H".to_vec()
+        }),
+        PhysicalKey::Code(KeyCode::End) => Some(if modes.application_cursor_keys {
+            b"\x1bOF".to_vec()
+        } else {
+            b"\x1b[F".to_vec()
+        }),
+        PhysicalKey::Code(KeyCode::Delete) => Some(b"\x1b[3~".to_vec()),
+        PhysicalKey::Code(KeyCode::Insert) => Some(b"\x1b[2~".to_vec()),
+        PhysicalKey::Code(KeyCode::PageUp) => Some(b"\x1b[5~".to_vec()),
+        PhysicalKey::Code(KeyCode::PageDown) => Some(b"\x1b[6~".to_vec()),
+        PhysicalKey::Code(KeyCode::F1) => Some(b"\x1bOP".to_vec()),
+        PhysicalKey::Code(KeyCode::F2) => Some(b"\x1bOQ".to_vec()),
+        PhysicalKey::Code(KeyCode::F3) => Some(b"\x1bOR".to_vec()),
+        PhysicalKey::Code(KeyCode::F4) => Some(b"\x1bOS".to_vec()),
+        PhysicalKey::Code(KeyCode::F5) => Some(b"\x1b[15~".to_vec()),
+        PhysicalKey::Code(KeyCode::F6) => Some(b"\x1b[17~".to_vec()),
+        PhysicalKey::Code(KeyCode::F7) => Some(b"\x1b[18~".to_vec()),
+        PhysicalKey::Code(KeyCode::F8) => Some(b"\x1b[19~".to_vec()),
+        PhysicalKey::Code(KeyCode::F9) => Some(b"\x1b[20~".to_vec()),
+        PhysicalKey::Code(KeyCode::F10) => Some(b"\x1b[21~".to_vec()),
+        PhysicalKey::Code(KeyCode::F11) => Some(b"\x1b[23~".to_vec()),
+        PhysicalKey::Code(KeyCode::F12) => Some(b"\x1b[24~".to_vec()),
+        _ => None,
+    }
+}
+
 pub(crate) fn modified_key_bytes(
     key: &Key,
+    physical_key: &PhysicalKey,
     modifiers: ModifiersState,
     modes: TerminalModes,
 ) -> Option<Vec<u8>> {
@@ -56,6 +97,10 @@ pub(crate) fn modified_key_bytes(
 
     if modifiers.control_key() && !modifiers.alt_key() {
         return control_sequence_for_key(key);
+    }
+
+    if let Some(bytes) = physical_key_bytes(physical_key, modes) {
+        return Some(bytes);
     }
 
     named_key_bytes(key, modes)
@@ -87,7 +132,7 @@ pub(crate) fn normalize_paste(text: &str, modes: TerminalModes) -> Vec<u8> {
 }
 
 pub(crate) fn should_capture_mouse(modes: TerminalModes) -> bool {
-    modes.alternate_screen || modes.mouse_reporting != MouseReportingMode::Off
+    modes.mouse_reporting != MouseReportingMode::Off
 }
 
 pub(crate) fn encode_mouse_button(
@@ -227,18 +272,20 @@ mod tests {
     use super::{encode_mouse_wheel, modified_key_bytes, normalize_paste, should_capture_mouse};
     use crate::gui::tab::CellPoint;
     use easyterm_core::{MouseReportingMode, TerminalModes};
-    use winit::keyboard::{Key, ModifiersState, NamedKey};
+    use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 
     #[test]
     fn arrows_switch_to_application_cursor_mode() {
         let normal = modified_key_bytes(
             &Key::Named(NamedKey::ArrowUp),
+            &PhysicalKey::Code(KeyCode::ArrowUp),
             ModifiersState::default(),
             TerminalModes::default(),
         )
         .unwrap();
         let application = modified_key_bytes(
             &Key::Named(NamedKey::ArrowUp),
+            &PhysicalKey::Code(KeyCode::ArrowUp),
             ModifiersState::default(),
             TerminalModes {
                 application_cursor_keys: true,
@@ -265,8 +312,8 @@ mod tests {
     }
 
     #[test]
-    fn alternate_screen_captures_mouse() {
-        assert!(should_capture_mouse(TerminalModes {
+    fn mouse_reporting_captures_mouse() {
+        assert!(!should_capture_mouse(TerminalModes {
             alternate_screen: true,
             ..TerminalModes::default()
         }));

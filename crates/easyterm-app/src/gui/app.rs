@@ -24,6 +24,7 @@ use winit::window::{Window, WindowId};
 
 const CURSOR_BLINK_ON: Duration = Duration::from_millis(550);
 const CURSOR_BLINK_OFF: Duration = Duration::from_millis(450);
+const PTY_REDRAW_DEBOUNCE: Duration = Duration::from_millis(8);
 
 pub fn run_gui(config: AppConfig) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
@@ -48,6 +49,11 @@ struct GuiApp {
     selecting: bool,
     last_error: Option<String>,
     cursor_blink_epoch: Instant,
+    last_cursor_visible: bool,
+    needs_redraw: bool,
+    pending_pty_redraw: bool,
+    last_pty_activity: Option<Instant>,
+    awaiting_ime_commit: bool,
 }
 
 impl GuiApp {
@@ -68,6 +74,11 @@ impl GuiApp {
             selecting: false,
             last_error: None,
             cursor_blink_epoch: Instant::now(),
+            last_cursor_visible: true,
+            needs_redraw: true,
+            pending_pty_redraw: false,
+            last_pty_activity: None,
+            awaiting_ime_commit: false,
         }
     }
 
@@ -99,6 +110,7 @@ impl GuiApp {
 
         let pty_size = self.current_terminal_size();
         self.open_tab(self.default_shell_spec(), pty_size)?;
+        self.needs_redraw = true;
         Ok(())
     }
 
@@ -122,6 +134,7 @@ impl GuiApp {
         )?;
         self.tabs.push(tab);
         self.active_tab = self.tabs.len().saturating_sub(1);
+        self.needs_redraw = true;
         Ok(())
     }
 
@@ -158,6 +171,7 @@ impl GuiApp {
         for tab in &mut self.tabs {
             let _ = tab.resize(term_size);
         }
+        self.needs_redraw = true;
     }
 
     fn handle_keyboard_input(
@@ -166,6 +180,7 @@ impl GuiApp {
         event: &winit::event::KeyEvent,
     ) {
         if event.state != ElementState::Pressed {
+            self.awaiting_ime_commit = false;
             return;
         }
 
@@ -174,20 +189,25 @@ impl GuiApp {
                 Key::Character(value) if value.eq_ignore_ascii_case("t") => {
                     let _ = self.open_tab(self.default_shell_spec(), self.current_terminal_size());
                     self.reset_cursor_blink();
+                    self.awaiting_ime_commit = false;
                     return;
                 }
                 Key::Character(value) if value.eq_ignore_ascii_case("c") => {
                     self.copy_selection_to_clipboard();
+                    self.needs_redraw = true;
+                    self.awaiting_ime_commit = false;
                     return;
                 }
                 Key::Character(value) if value.eq_ignore_ascii_case("v") => {
                     self.paste_from_clipboard();
                     self.reset_cursor_blink();
+                    self.awaiting_ime_commit = false;
                     return;
                 }
                 Key::Character(value) if value.eq_ignore_ascii_case("w") => {
                     self.close_active_tab(event_loop);
                     self.reset_cursor_blink();
+                    self.awaiting_ime_commit = false;
                     return;
                 }
                 _ => {}
@@ -197,12 +217,15 @@ impl GuiApp {
         let modifiers = self.modifiers;
         let modes = self.active_terminal_modes();
 
-        if let Some(bytes) = modified_key_bytes(&event.logical_key, modifiers, modes) {
+        if let Some(bytes) =
+            modified_key_bytes(&event.logical_key, &event.physical_key, modifiers, modes)
+        {
             if let Some(tab) = self.active_tab_mut() {
                 let _ = tab.send_input(&bytes);
                 tab.clear_selection();
             }
             self.reset_cursor_blink();
+            self.awaiting_ime_commit = false;
             return;
         }
 
@@ -213,8 +236,13 @@ impl GuiApp {
                     tab.clear_selection();
                 }
                 self.reset_cursor_blink();
+                self.awaiting_ime_commit = false;
+                return;
             }
         }
+
+        self.awaiting_ime_commit =
+            !modifiers.control_key() && !modifiers.alt_key() && !modifiers.super_key();
     }
 
     fn close_active_tab(&mut self, event_loop: &ActiveEventLoop) {
@@ -230,9 +258,14 @@ impl GuiApp {
         } else if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         }
+        self.needs_redraw = true;
     }
 
     fn handle_ime_commit(&mut self, text: &str) {
+        if !self.awaiting_ime_commit {
+            return;
+        }
+        self.awaiting_ime_commit = false;
         if self.modifiers.control_key() || self.modifiers.alt_key() || self.modifiers.super_key() {
             return;
         }
@@ -257,6 +290,7 @@ impl GuiApp {
             if state == ElementState::Pressed {
                 self.active_tab = index;
                 self.reset_cursor_blink();
+                self.needs_redraw = true;
             }
             return;
         }
@@ -290,6 +324,7 @@ impl GuiApp {
                 tab.clear_selection();
             }
             self.reset_cursor_blink();
+            self.needs_redraw = true;
         } else {
             if button == MouseButton::Middle && state == ElementState::Pressed {
                 self.paste_from_clipboard();
@@ -307,12 +342,14 @@ impl GuiApp {
                 if let (Some(tab), Some(cell)) = (self.active_tab_mut(), cell) {
                     tab.begin_selection(cell);
                 }
+                self.needs_redraw = true;
             } else {
                 self.selecting = false;
                 self.pressed_mouse_button = None;
                 if let Some(tab) = self.active_tab_mut() {
                     tab.finish_selection();
                 }
+                self.needs_redraw = true;
             }
         }
 
@@ -344,6 +381,7 @@ impl GuiApp {
         }
         if let (Some(tab), Some(cell)) = (self.active_tab_mut(), cell) {
             tab.update_selection(cell);
+            self.needs_redraw = true;
         }
     }
 
@@ -370,6 +408,7 @@ impl GuiApp {
             }
         } else if let Some(tab) = self.active_tab_mut() {
             tab.scroll(lines);
+            self.needs_redraw = true;
         }
     }
 
@@ -408,12 +447,16 @@ impl GuiApp {
             cursor_visible,
         );
         buffer.present()?;
+        self.last_cursor_visible = cursor_visible;
+        self.needs_redraw = false;
+        self.pending_pty_redraw = false;
         Ok(())
     }
 
     fn poll_tabs(&mut self) -> bool {
+        let mut visual_changed = false;
         for tab in &mut self.tabs {
-            tab.drain_output();
+            visual_changed |= tab.drain_output();
             let _ = tab.refresh_exit_state();
         }
 
@@ -424,6 +467,7 @@ impl GuiApp {
             if self.tabs[index].is_exited() {
                 let mut tab = self.tabs.remove(index);
                 let _ = tab.shutdown();
+                visual_changed = true;
                 if index < self.active_tab {
                     removed_before_active += 1;
                 }
@@ -439,6 +483,11 @@ impl GuiApp {
             .active_tab
             .saturating_sub(removed_before_active)
             .min(self.tabs.len() - 1);
+        if visual_changed {
+            self.pending_pty_redraw = true;
+            self.last_pty_activity = Some(Instant::now());
+        }
+        self.needs_redraw |= visual_changed;
         false
     }
 
@@ -450,6 +499,7 @@ impl GuiApp {
 
     fn reset_cursor_blink(&mut self) {
         self.cursor_blink_epoch = Instant::now();
+        self.needs_redraw = true;
     }
 
     fn copy_selection_to_clipboard(&mut self) {
@@ -465,6 +515,7 @@ impl GuiApp {
 
         if let Err(err) = self.clipboard.set_text(&selection) {
             self.last_error = Some(format!("clipboard copy failed: {err}"));
+            self.needs_redraw = true;
         }
     }
 
@@ -478,7 +529,10 @@ impl GuiApp {
                 }
             }
             Ok(_) => {}
-            Err(err) => self.last_error = Some(format!("clipboard paste failed: {err}")),
+            Err(err) => {
+                self.last_error = Some(format!("clipboard paste failed: {err}"));
+                self.needs_redraw = true;
+            }
         }
     }
 }
@@ -501,10 +555,6 @@ impl ApplicationHandler for GuiApp {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => self.on_resize(size),
             WindowEvent::RedrawRequested => {
-                if self.poll_tabs() {
-                    event_loop.exit();
-                    return;
-                }
                 if let Err(err) = self.draw() {
                     self.last_error = Some(err.to_string());
                     event_loop.exit();
@@ -524,9 +574,22 @@ impl ApplicationHandler for GuiApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = self.window.as_ref() {
-            window.request_redraw();
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.poll_tabs() {
+            event_loop.exit();
+            return;
+        }
+
+        let cursor_visible = self.cursor_visible();
+        let pty_redraw_ready = self.pending_pty_redraw
+            && self
+                .last_pty_activity
+                .map_or(true, |instant| instant.elapsed() >= PTY_REDRAW_DEBOUNCE);
+
+        if self.needs_redraw || pty_redraw_ready || cursor_visible != self.last_cursor_visible {
+            if let Some(window) = self.window.as_ref() {
+                window.request_redraw();
+            }
         }
     }
 }

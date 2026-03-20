@@ -1,4 +1,4 @@
-use crate::ansi::{parse_ansi, AnsiEvent, ClearMode, Color, DecMode, Style};
+use crate::ansi::{parse_ansi_stream, AnsiEvent, ClearMode, Color, DecMode, Style};
 use crate::grid::{Cell, Cursor, Grid};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -42,6 +42,8 @@ impl ScreenBuffer {
     }
 
     fn resize(&mut self, width: usize, height: usize) {
+        let old_height = self.grid.height();
+        let was_full_region = self.scroll_region == (0, old_height.saturating_sub(1));
         self.grid.resize(width, height);
         self.cursor.row = self.cursor.row.min(self.grid.height().saturating_sub(1));
         self.cursor.col = self.cursor.col.min(self.grid.width().saturating_sub(1));
@@ -53,16 +55,20 @@ impl ScreenBuffer {
             .saved_cursor
             .col
             .min(self.grid.width().saturating_sub(1));
-        self.scroll_region.0 = self
-            .scroll_region
-            .0
-            .min(self.grid.height().saturating_sub(1));
-        self.scroll_region.1 = self
-            .scroll_region
-            .1
-            .min(self.grid.height().saturating_sub(1));
-        if self.scroll_region.0 > self.scroll_region.1 {
+        if was_full_region {
             self.scroll_region = (0, self.grid.height().saturating_sub(1));
+        } else {
+            self.scroll_region.0 = self
+                .scroll_region
+                .0
+                .min(self.grid.height().saturating_sub(1));
+            self.scroll_region.1 = self
+                .scroll_region
+                .1
+                .min(self.grid.height().saturating_sub(1));
+            if self.scroll_region.0 > self.scroll_region.1 {
+                self.scroll_region = (0, self.grid.height().saturating_sub(1));
+            }
         }
         if self.grid.width() == 1 && self.cursor.col == 0 {
             self.pending_wrap = false;
@@ -80,9 +86,11 @@ impl ScreenBuffer {
 pub struct Terminal {
     primary: ScreenBuffer,
     alternate: ScreenBuffer,
-    scrollback: Vec<String>,
+    scrollback: Vec<Vec<Cell>>,
     window_title: String,
     modes: TerminalModes,
+    pending_bytes: Vec<u8>,
+    change_seq: u64,
 }
 
 impl Terminal {
@@ -93,6 +101,8 @@ impl Terminal {
             scrollback: Vec::new(),
             window_title: String::new(),
             modes: TerminalModes::default(),
+            pending_bytes: Vec::new(),
+            change_seq: 0,
         }
     }
 
@@ -108,16 +118,20 @@ impl Terminal {
         self.active_buffer().active_style
     }
 
-    pub fn scrollback(&self) -> &[String] {
+    pub fn scrollback(&self) -> &[Vec<Cell>] {
         &self.scrollback
     }
 
-    pub fn view_scrollback(&self) -> &[String] {
+    pub fn view_scrollback(&self) -> &[Vec<Cell>] {
         if self.modes.alternate_screen {
             &[]
         } else {
             &self.scrollback
         }
+    }
+
+    pub fn scrollback_row(&self, row: usize) -> Option<&[Cell]> {
+        self.view_scrollback().get(row).map(Vec::as_slice)
     }
 
     pub fn window_title(&self) -> &str {
@@ -128,19 +142,40 @@ impl Terminal {
         self.modes
     }
 
+    pub fn change_seq(&self) -> u64 {
+        self.change_seq
+    }
+
     pub fn resize(&mut self, width: usize, height: usize) {
         self.primary.resize(width, height);
         self.alternate.resize(width, height);
+        self.bump_change_seq();
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
-        for event in parse_ansi(bytes) {
+        self.pending_bytes.extend_from_slice(bytes);
+        let (events, consumed) = parse_ansi_stream(&self.pending_bytes);
+        for event in events {
             self.apply(event);
+        }
+        if consumed > 0 {
+            self.pending_bytes.drain(..consumed);
         }
     }
 
     pub fn visible_lines(&self) -> Vec<String> {
         self.grid().snapshot()
+    }
+
+    pub fn trim_scrollback(&mut self, max_lines: usize) -> usize {
+        if self.scrollback.len() <= max_lines {
+            return 0;
+        }
+
+        let removed = self.scrollback.len() - max_lines;
+        self.scrollback.drain(..removed);
+        self.bump_change_seq();
+        removed
     }
 
     fn active_buffer(&self) -> &ScreenBuffer {
@@ -160,6 +195,7 @@ impl Terminal {
     }
 
     fn apply(&mut self, event: AnsiEvent) {
+        self.bump_change_seq();
         match event {
             AnsiEvent::Print(ch) => self.put_char(ch),
             AnsiEvent::NewLine => {
@@ -213,6 +249,11 @@ impl Terminal {
                     .col
                     .saturating_sub(steps as usize);
             }
+            AnsiEvent::CursorHorizontalAbsolute(col) => {
+                let width = self.grid().width();
+                self.active_buffer_mut().cursor.col =
+                    (col.saturating_sub(1) as usize).min(width.saturating_sub(1));
+            }
             AnsiEvent::CursorPosition { row, col } => {
                 let width = self.grid().width();
                 let height = self.grid().height();
@@ -221,6 +262,9 @@ impl Terminal {
                 buffer.cursor.col = (col.saturating_sub(1) as usize).min(width.saturating_sub(1));
             }
             AnsiEvent::SetScrollRegion { top, bottom } => self.set_scroll_region(top, bottom),
+            AnsiEvent::InsertBlankChars(count) => self.insert_blank_chars(count as usize),
+            AnsiEvent::DeleteChars(count) => self.delete_chars(count as usize),
+            AnsiEvent::EraseChars(count) => self.erase_chars(count as usize),
             AnsiEvent::InsertLines(count) => self.insert_lines(count as usize),
             AnsiEvent::DeleteLines(count) => self.delete_lines(count as usize),
             AnsiEvent::ClearLine(mode) => self.clear_line(mode),
@@ -308,7 +352,9 @@ impl Terminal {
     fn scroll_up_region(&mut self) {
         let (top, bottom) = self.active_buffer().scroll_region;
         if !self.modes.alternate_screen && top == 0 && bottom + 1 == self.primary.grid.height() {
-            self.scrollback.push(self.primary.grid.row_text(top));
+            if let Some(row) = self.primary.grid.row(top) {
+                self.scrollback.push(row.to_vec());
+            }
         }
 
         let buffer = self.active_buffer_mut();
@@ -361,6 +407,74 @@ impl Terminal {
         }
     }
 
+    fn insert_blank_chars(&mut self, count: usize) {
+        let row = self.active_buffer().cursor.row;
+        let start_col = self.active_buffer().cursor.col;
+        let width = self.grid().width();
+        if start_col >= width {
+            return;
+        }
+
+        let count = count.min(width - start_col);
+        let buffer = self.active_buffer_mut();
+        for col in (start_col + count..width).rev() {
+            let src = buffer
+                .grid
+                .get(row, col - count)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(cell) = buffer.grid.get_mut(row, col) {
+                *cell = src;
+            }
+        }
+        for col in start_col..start_col + count {
+            if let Some(cell) = buffer.grid.get_mut(row, col) {
+                *cell = Cell::default();
+            }
+        }
+    }
+
+    fn delete_chars(&mut self, count: usize) {
+        let row = self.active_buffer().cursor.row;
+        let start_col = self.active_buffer().cursor.col;
+        let width = self.grid().width();
+        if start_col >= width {
+            return;
+        }
+
+        let count = count.min(width - start_col);
+        let buffer = self.active_buffer_mut();
+        for col in start_col..width.saturating_sub(count) {
+            let src = buffer
+                .grid
+                .get(row, col + count)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(cell) = buffer.grid.get_mut(row, col) {
+                *cell = src;
+            }
+        }
+        for col in width.saturating_sub(count)..width {
+            if let Some(cell) = buffer.grid.get_mut(row, col) {
+                *cell = Cell::default();
+            }
+        }
+    }
+
+    fn erase_chars(&mut self, count: usize) {
+        let row = self.active_buffer().cursor.row;
+        let start_col = self.active_buffer().cursor.col;
+        let width = self.grid().width();
+        let end_col = (start_col + count).min(width);
+        let buffer = self.active_buffer_mut();
+
+        for col in start_col..end_col {
+            if let Some(cell) = buffer.grid.get_mut(row, col) {
+                *cell = Cell::default();
+            }
+        }
+    }
+
     fn clear_line(&mut self, mode: ClearMode) {
         let row = self.active_buffer().cursor.row;
         let col = self.active_buffer().cursor.col;
@@ -403,11 +517,19 @@ impl Terminal {
             match param {
                 0 => buffer.active_style = Style::default(),
                 1 => buffer.active_style.bold = true,
+                2 => buffer.active_style.dim = true,
                 3 => buffer.active_style.italic = true,
                 4 => buffer.active_style.underline = true,
-                22 => buffer.active_style.bold = false,
+                7 => buffer.active_style.inverse = true,
+                8 => buffer.active_style.hidden = true,
+                22 => {
+                    buffer.active_style.bold = false;
+                    buffer.active_style.dim = false;
+                }
                 23 => buffer.active_style.italic = false,
                 24 => buffer.active_style.underline = false,
+                27 => buffer.active_style.inverse = false,
+                28 => buffer.active_style.hidden = false,
                 30..=37 => buffer.active_style.fg = Color::Indexed((param - 30) as u8),
                 39 => buffer.active_style.fg = Color::Default,
                 40..=47 => buffer.active_style.bg = Color::Indexed((param - 40) as u8),
@@ -482,6 +604,10 @@ impl Terminal {
             DecMode::BracketedPaste => self.modes.bracketed_paste = enabled,
         }
     }
+
+    fn bump_change_seq(&mut self) {
+        self.change_seq = self.change_seq.wrapping_add(1);
+    }
 }
 
 fn parse_extended_color<I>(iter: &mut std::iter::Peekable<I>) -> Option<Color>
@@ -521,6 +647,7 @@ fn char_width(ch: char) -> usize {
 mod tests {
     use super::{MouseReportingMode, Terminal, TerminalModes};
     use crate::ansi::Color;
+    use crate::grid::Grid;
 
     #[test]
     fn writes_and_wraps_text() {
@@ -575,12 +702,39 @@ mod tests {
     }
 
     #[test]
+    fn resize_keeps_fullscreen_scroll_region_full_height() {
+        let mut terminal = Terminal::new(4, 4);
+        terminal.feed(b"a\nb\nc\nd");
+        terminal.resize(4, 8);
+        terminal.feed(b"\ne");
+
+        assert_eq!(terminal.visible_lines()[4], "e");
+    }
+
+    #[test]
     fn scrollback_collects_scrolled_lines() {
         let mut terminal = Terminal::new(3, 2);
         terminal.feed(b"one\ntwo\nthree");
 
-        assert_eq!(terminal.scrollback(), &["one", "two"]);
+        assert_eq!(
+            terminal
+                .scrollback()
+                .iter()
+                .map(|row| Grid::cells_text(row))
+                .collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
         assert_eq!(terminal.visible_lines(), vec!["thr", "ee"]);
+    }
+
+    #[test]
+    fn scrollback_preserves_cell_styles() {
+        let mut terminal = Terminal::new(2, 1);
+        terminal.feed(b"\x1b[31mA\nB");
+
+        let row = terminal.scrollback_row(0).unwrap();
+        assert_eq!(Grid::cells_text(row), "A");
+        assert_eq!(row[0].style.fg, Color::Indexed(1));
     }
 
     #[test]
@@ -668,5 +822,59 @@ mod tests {
             terminal.visible_lines(),
             vec!["one", "thr", "fur", "", "fiv"]
         );
+    }
+
+    #[test]
+    fn erase_chars_clears_existing_text_without_moving_cursor() {
+        let mut terminal = Terminal::new(14, 2);
+        terminal.feed(b"-- INSERT --");
+        terminal.feed(b"\r\x1b[67X");
+
+        assert_eq!(terminal.visible_lines(), vec!["", ""]);
+        assert_eq!(terminal.cursor().col, 0);
+    }
+
+    #[test]
+    fn insert_and_delete_chars_shift_line_content() {
+        let mut terminal = Terminal::new(8, 2);
+        terminal.feed(b"abcdef");
+        terminal.feed(b"\r\x1b[3G\x1b[2P");
+        assert_eq!(terminal.visible_lines(), vec!["abef", ""]);
+
+        terminal.feed(b"\r\x1b[2G\x1b[3@Z");
+        assert_eq!(terminal.visible_lines(), vec!["aZbef", ""]);
+    }
+
+    #[test]
+    fn preserves_split_escape_sequences_between_feeds() {
+        let mut terminal = Terminal::new(14, 2);
+        terminal.feed(b"-- INSERT --");
+        terminal.feed(b"\r\x1b[6");
+        terminal.feed(b"7X");
+
+        assert_eq!(terminal.visible_lines(), vec!["", ""]);
+    }
+
+    #[test]
+    fn tracks_extended_sgr_flags() {
+        let mut terminal = Terminal::new(8, 2);
+        terminal.feed(b"\x1b[1;2;3;4;7;8mA");
+
+        let cell = terminal.grid().get(0, 0).unwrap();
+        assert!(cell.style.bold);
+        assert!(cell.style.dim);
+        assert!(cell.style.italic);
+        assert!(cell.style.underline);
+        assert!(cell.style.inverse);
+        assert!(cell.style.hidden);
+
+        terminal.feed(b"\x1b[22;23;24;27;28mB");
+        let cell = terminal.grid().get(0, 1).unwrap();
+        assert!(!cell.style.bold);
+        assert!(!cell.style.dim);
+        assert!(!cell.style.italic);
+        assert!(!cell.style.underline);
+        assert!(!cell.style.inverse);
+        assert!(!cell.style.hidden);
     }
 }
