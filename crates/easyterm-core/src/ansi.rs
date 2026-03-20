@@ -35,21 +35,50 @@ pub enum ClearMode {
     All,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecMode {
+    ApplicationCursorKeys,
+    MouseClickReporting,
+    MouseDragReporting,
+    MouseMotionReporting,
+    SgrMouse,
+    AlternateScreen,
+    BracketedPaste,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnsiEvent {
     Print(char),
     NewLine,
     CarriageReturn,
     Backspace,
+    Index,
+    ReverseIndex,
+    NextLine,
+    SaveCursor,
+    RestoreCursor,
     CursorUp(u16),
     CursorDown(u16),
     CursorForward(u16),
     CursorBackward(u16),
-    CursorPosition { row: u16, col: u16 },
+    CursorPosition {
+        row: u16,
+        col: u16,
+    },
+    SetScrollRegion {
+        top: Option<u16>,
+        bottom: Option<u16>,
+    },
+    InsertLines(u16),
+    DeleteLines(u16),
     ClearLine(ClearMode),
     ClearScreen(ClearMode),
     SetStyle(Vec<u16>),
     SetWindowTitle(String),
+    SetDecMode {
+        mode: DecMode,
+        enabled: bool,
+    },
 }
 
 pub fn parse_ansi(input: &[u8]) -> Vec<AnsiEvent> {
@@ -84,8 +113,7 @@ pub fn parse_ansi(input: &[u8]) -> Vec<AnsiEvent> {
                     if j < input.len() {
                         let final_byte = input[j] as char;
                         let params = std::str::from_utf8(&input[i + 2..j]).unwrap_or("");
-                        let numbers = parse_numbers(params);
-                        decode_csi(final_byte, numbers, &mut events);
+                        decode_csi(final_byte, params, &mut events);
                         i = j + 1;
                     } else {
                         break;
@@ -99,6 +127,11 @@ pub fn parse_ansi(input: &[u8]) -> Vec<AnsiEvent> {
                     } else {
                         break;
                     }
+                } else if let Some((event, next_i)) = parse_escape_sequence(input, i + 1) {
+                    if let Some(event) = event {
+                        events.push(event);
+                    }
+                    i = next_i;
                 } else {
                     i += 1;
                 }
@@ -130,7 +163,10 @@ fn parse_numbers(params: &str) -> Vec<u16> {
         .collect()
 }
 
-fn decode_csi(final_byte: char, numbers: Vec<u16>, events: &mut Vec<AnsiEvent>) {
+fn decode_csi(final_byte: char, params: &str, events: &mut Vec<AnsiEvent>) {
+    let private = params.strip_prefix('?');
+    let numbers = parse_numbers(private.unwrap_or(params));
+
     match final_byte {
         'A' => events.push(AnsiEvent::CursorUp(first_or(&numbers, 1))),
         'B' => events.push(AnsiEvent::CursorDown(first_or(&numbers, 1))),
@@ -141,12 +177,18 @@ fn decode_csi(final_byte: char, numbers: Vec<u16>, events: &mut Vec<AnsiEvent>) 
             let col = *numbers.get(1).unwrap_or(&1);
             events.push(AnsiEvent::CursorPosition { row, col });
         }
+        'L' => events.push(AnsiEvent::InsertLines(first_or(&numbers, 1))),
+        'M' => events.push(AnsiEvent::DeleteLines(first_or(&numbers, 1))),
         'J' => events.push(AnsiEvent::ClearScreen(parse_clear_mode(first_or(
             &numbers, 0,
         )))),
         'K' => events.push(AnsiEvent::ClearLine(parse_clear_mode(first_or(
             &numbers, 0,
         )))),
+        'r' => events.push(AnsiEvent::SetScrollRegion {
+            top: numbers.first().copied(),
+            bottom: numbers.get(1).copied(),
+        }),
         'm' => {
             if numbers.is_empty() {
                 events.push(AnsiEvent::SetStyle(vec![0]));
@@ -154,7 +196,28 @@ fn decode_csi(final_byte: char, numbers: Vec<u16>, events: &mut Vec<AnsiEvent>) 
                 events.push(AnsiEvent::SetStyle(numbers));
             }
         }
+        'h' | 'l' if private.is_some() => {
+            let enabled = final_byte == 'h';
+            for number in numbers {
+                if let Some(mode) = dec_mode(number) {
+                    events.push(AnsiEvent::SetDecMode { mode, enabled });
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+fn dec_mode(number: u16) -> Option<DecMode> {
+    match number {
+        1 => Some(DecMode::ApplicationCursorKeys),
+        47 | 1047 | 1049 => Some(DecMode::AlternateScreen),
+        1000 => Some(DecMode::MouseClickReporting),
+        1002 => Some(DecMode::MouseDragReporting),
+        1003 => Some(DecMode::MouseMotionReporting),
+        1006 => Some(DecMode::SgrMouse),
+        2004 => Some(DecMode::BracketedPaste),
+        _ => None,
     }
 }
 
@@ -216,9 +279,31 @@ fn parse_osc_sequence(input: &[u8], start: usize) -> Option<(Option<AnsiEvent>, 
     Some((event, next_i))
 }
 
+fn parse_escape_sequence(input: &[u8], start: usize) -> Option<(Option<AnsiEvent>, usize)> {
+    let byte = *input.get(start)?;
+    let next_i = start + 1;
+    let event = match byte {
+        b'D' => Some(AnsiEvent::Index),
+        b'M' => Some(AnsiEvent::ReverseIndex),
+        b'E' => Some(AnsiEvent::NextLine),
+        b'7' => Some(AnsiEvent::SaveCursor),
+        b'8' => Some(AnsiEvent::RestoreCursor),
+        b'(' | b')' | b'*' | b'+' => {
+            if input.get(start + 1).is_some() {
+                return Some((None, start + 2));
+            }
+            return None;
+        }
+        b'=' | b'>' => None,
+        _ => None,
+    };
+
+    Some((event, next_i))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_ansi, AnsiEvent, ClearMode, Color, Style};
+    use super::{parse_ansi, AnsiEvent, ClearMode, Color, DecMode, Style};
 
     #[test]
     fn parses_text_and_control_flow() {
@@ -244,6 +329,67 @@ mod tests {
                 AnsiEvent::Print('A'),
                 AnsiEvent::CursorBackward(2),
                 AnsiEvent::ClearLine(ClearMode::All),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_private_modes() {
+        let events = parse_ansi(b"\x1b[?1;1006;2004h\x1b[?1;2004l");
+        assert_eq!(
+            events,
+            vec![
+                AnsiEvent::SetDecMode {
+                    mode: DecMode::ApplicationCursorKeys,
+                    enabled: true,
+                },
+                AnsiEvent::SetDecMode {
+                    mode: DecMode::SgrMouse,
+                    enabled: true,
+                },
+                AnsiEvent::SetDecMode {
+                    mode: DecMode::BracketedPaste,
+                    enabled: true,
+                },
+                AnsiEvent::SetDecMode {
+                    mode: DecMode::ApplicationCursorKeys,
+                    enabled: false,
+                },
+                AnsiEvent::SetDecMode {
+                    mode: DecMode::BracketedPaste,
+                    enabled: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_escape_sequences_used_by_vim() {
+        let events = parse_ansi(b"\x1b(B\x1b7\x1b8\x1bM\x1bD\x1bE");
+        assert_eq!(
+            events,
+            vec![
+                AnsiEvent::SaveCursor,
+                AnsiEvent::RestoreCursor,
+                AnsiEvent::ReverseIndex,
+                AnsiEvent::Index,
+                AnsiEvent::NextLine,
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_scroll_region_and_line_ops() {
+        let events = parse_ansi(b"\x1b[2;5r\x1b[2L\x1b[3M");
+        assert_eq!(
+            events,
+            vec![
+                AnsiEvent::SetScrollRegion {
+                    top: Some(2),
+                    bottom: Some(5),
+                },
+                AnsiEvent::InsertLines(2),
+                AnsiEvent::DeleteLines(3),
             ]
         );
     }

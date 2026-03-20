@@ -1,6 +1,6 @@
 use crate::pty::{spawn_local_runtime, LocalPtyError, PtyRuntime, PtySize};
 use crate::session::LocalSessionSpec;
-use easyterm_core::Terminal;
+use easyterm_core::{MouseReportingMode, Terminal, TerminalModes};
 use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::process::ExitStatus;
@@ -55,6 +55,10 @@ impl GuiTab {
         &self.terminal
     }
 
+    pub(crate) fn terminal_modes(&self) -> TerminalModes {
+        self.terminal.modes()
+    }
+
     pub(crate) fn scroll_offset(&self) -> usize {
         self.scroll_offset
     }
@@ -77,7 +81,10 @@ impl GuiTab {
             self.terminal.feed(&chunk);
         }
 
-        if self.terminal.scrollback().len() > self.scrollback_limit {
+        if !self.allows_local_scrollback() {
+            self.scroll_offset = 0;
+            self.clear_selection();
+        } else if self.terminal.scrollback().len() > self.scrollback_limit {
             self.scroll_offset = min(
                 self.scroll_offset,
                 self.max_scroll_offset(self.terminal.grid().height()),
@@ -97,6 +104,9 @@ impl GuiTab {
     }
 
     pub(crate) fn scroll(&mut self, delta_lines: i32) {
+        if !self.allows_local_scrollback() {
+            return;
+        }
         let max_offset = self.max_scroll_offset(self.terminal.grid().height());
         let updated = if delta_lines > 0 {
             self.scroll_offset.saturating_add(delta_lines as usize)
@@ -113,11 +123,17 @@ impl GuiTab {
     }
 
     pub(crate) fn begin_selection(&mut self, point: CellPoint) {
+        if !self.allows_local_selection() {
+            return;
+        }
         self.selection_anchor = Some(point);
         self.selection_focus = Some(point);
     }
 
     pub(crate) fn update_selection(&mut self, point: CellPoint) {
+        if !self.allows_local_selection() {
+            return;
+        }
         self.selection_focus = Some(point);
     }
 
@@ -190,7 +206,7 @@ impl GuiTab {
     }
 
     fn total_lines(&self) -> usize {
-        self.terminal.scrollback().len() + self.terminal.grid().height()
+        self.terminal.view_scrollback().len() + self.terminal.grid().height()
     }
 
     fn max_scroll_offset(&self, viewport_rows: usize) -> usize {
@@ -198,16 +214,26 @@ impl GuiTab {
     }
 
     fn line_text(&self, global_row: usize) -> Option<String> {
-        if global_row < self.terminal.scrollback().len() {
-            return Some(self.terminal.scrollback()[global_row].clone());
+        let scrollback = self.terminal.view_scrollback();
+        if global_row < scrollback.len() {
+            return Some(scrollback[global_row].clone());
         }
 
-        let grid_row = global_row.checked_sub(self.terminal.scrollback().len())?;
+        let grid_row = global_row.checked_sub(scrollback.len())?;
         if grid_row >= self.terminal.grid().height() {
             return None;
         }
 
         Some(self.terminal.grid().row_text(grid_row))
+    }
+
+    pub(crate) fn allows_local_scrollback(&self) -> bool {
+        let modes = self.terminal.modes();
+        !modes.alternate_screen && modes.mouse_reporting == MouseReportingMode::Off
+    }
+
+    pub(crate) fn allows_local_selection(&self) -> bool {
+        self.allows_local_scrollback()
     }
 }
 

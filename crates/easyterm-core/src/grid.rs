@@ -97,6 +97,19 @@ impl Grid {
         }
     }
 
+    pub fn copy_row(&mut self, src_row: usize, dst_row: usize) {
+        if src_row >= self.height || dst_row >= self.height {
+            return;
+        }
+
+        for col in 0..self.width {
+            let src = self.get(src_row, col).cloned().unwrap_or_default();
+            if let Some(cell) = self.get_mut(dst_row, col) {
+                *cell = src;
+            }
+        }
+    }
+
     pub fn resize(&mut self, new_width: usize, new_height: usize) {
         let new_width = new_width.max(1);
         let new_height = new_height.max(1);

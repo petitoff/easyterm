@@ -145,7 +145,8 @@ impl RendererState {
         let cols = tab.terminal().grid().width();
         let rows = tab.terminal().grid().height();
         let viewport_start = tab.viewport_start(rows);
-        let current_start = tab.terminal().scrollback().len();
+        let scrollback = tab.terminal().view_scrollback();
+        let current_start = scrollback.len();
 
         for row in 0..rows {
             let global_row = viewport_start + row;
@@ -158,7 +159,7 @@ impl RendererState {
                 let mut underline = false;
 
                 if global_row < current_start {
-                    if let Some(value) = tab.terminal().scrollback()[global_row].chars().nth(col) {
+                    if let Some(value) = scrollback[global_row].chars().nth(col) {
                         ch = value;
                     }
                 } else {
@@ -171,7 +172,9 @@ impl RendererState {
                     }
                 }
 
-                if tab.selection_contains(CellPoint { global_row, col }) {
+                if tab.allows_local_selection()
+                    && tab.selection_contains(CellPoint { global_row, col })
+                {
                     bg = rgb(52, 78, 116);
                 }
 

@@ -2,12 +2,14 @@ use crate::config::AppConfig;
 use crate::gui::canvas::Canvas;
 use crate::gui::clipboard::ClipboardState;
 use crate::gui::input::{
-    control_sequence_for_key, named_key_bytes, normalize_paste, should_forward_text,
+    encode_mouse_button, encode_mouse_motion, encode_mouse_wheel, modified_key_bytes,
+    normalize_paste, should_capture_mouse, should_forward_text,
 };
 use crate::gui::render::RendererState;
 use crate::gui::tab::{CellPoint, GuiTab};
 use crate::pty::PtySize;
 use crate::session::LocalSessionSpec;
+use easyterm_core::TerminalModes;
 use softbuffer::{Context, Surface};
 use std::error::Error;
 use std::num::NonZeroU32;
@@ -42,6 +44,7 @@ struct GuiApp {
     clipboard: ClipboardState,
     modifiers: ModifiersState,
     cursor_position: Option<PhysicalPosition<f64>>,
+    pressed_mouse_button: Option<MouseButton>,
     selecting: bool,
     last_error: Option<String>,
     cursor_blink_epoch: Instant,
@@ -61,6 +64,7 @@ impl GuiApp {
             clipboard: ClipboardState::new(),
             modifiers: ModifiersState::default(),
             cursor_position: None,
+            pressed_mouse_button: None,
             selecting: false,
             last_error: None,
             cursor_blink_epoch: Instant::now(),
@@ -136,6 +140,12 @@ impl GuiApp {
         self.tabs.get(self.active_tab)
     }
 
+    fn active_terminal_modes(&self) -> TerminalModes {
+        self.active_tab()
+            .map(|tab| tab.terminal_modes())
+            .unwrap_or_default()
+    }
+
     fn on_resize(&mut self, size: PhysicalSize<u32>) {
         if let Some(surface) = self.surface.as_mut() {
             let _ = surface.resize(
@@ -185,21 +195,11 @@ impl GuiApp {
         }
 
         let modifiers = self.modifiers;
+        let modes = self.active_terminal_modes();
 
-        if modifiers.control_key() && !modifiers.alt_key() {
-            if let Some(bytes) = control_sequence_for_key(&event.logical_key) {
-                if let Some(tab) = self.active_tab_mut() {
-                    let _ = tab.send_input(&bytes);
-                    tab.clear_selection();
-                }
-                self.reset_cursor_blink();
-                return;
-            }
-        }
-
-        if let Some(bytes) = named_key_bytes(&event.logical_key) {
+        if let Some(bytes) = modified_key_bytes(&event.logical_key, modifiers, modes) {
             if let Some(tab) = self.active_tab_mut() {
-                let _ = tab.send_input(bytes);
+                let _ = tab.send_input(&bytes);
                 tab.clear_selection();
             }
             self.reset_cursor_blink();
@@ -253,16 +253,6 @@ impl GuiApp {
             return;
         };
 
-        if button == MouseButton::Middle && state == ElementState::Pressed {
-            self.paste_from_clipboard();
-            self.reset_cursor_blink();
-            return;
-        }
-
-        if button != MouseButton::Left {
-            return;
-        }
-
         if let Some(index) = self.tab_index_at(position.x as usize, position.y as usize) {
             if state == ElementState::Pressed {
                 self.active_tab = index;
@@ -271,16 +261,58 @@ impl GuiApp {
             return;
         }
 
-        if state == ElementState::Pressed {
-            self.selecting = true;
-            let cell = self.point_to_cell(position);
-            if let (Some(tab), Some(cell)) = (self.active_tab_mut(), cell) {
-                tab.begin_selection(cell);
+        let cell = self.point_to_cell(position);
+        let modes = self.active_terminal_modes();
+        let capture_mouse = should_capture_mouse(modes);
+
+        if capture_mouse {
+            if let Some(cell) = cell {
+                if let Some(bytes) = encode_mouse_button(
+                    button,
+                    state == ElementState::Pressed,
+                    cell,
+                    self.modifiers,
+                    modes,
+                ) {
+                    if let Some(tab) = self.active_tab_mut() {
+                        let _ = tab.send_input(&bytes);
+                    }
+                }
             }
-        } else {
+
+            self.pressed_mouse_button = if state == ElementState::Pressed {
+                Some(button)
+            } else {
+                None
+            };
             self.selecting = false;
             if let Some(tab) = self.active_tab_mut() {
-                tab.finish_selection();
+                tab.clear_selection();
+            }
+            self.reset_cursor_blink();
+        } else {
+            if button == MouseButton::Middle && state == ElementState::Pressed {
+                self.paste_from_clipboard();
+                self.reset_cursor_blink();
+                return;
+            }
+
+            if button != MouseButton::Left {
+                return;
+            }
+
+            if state == ElementState::Pressed {
+                self.selecting = true;
+                self.pressed_mouse_button = Some(button);
+                if let (Some(tab), Some(cell)) = (self.active_tab_mut(), cell) {
+                    tab.begin_selection(cell);
+                }
+            } else {
+                self.selecting = false;
+                self.pressed_mouse_button = None;
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.finish_selection();
+                }
             }
         }
 
@@ -291,10 +323,25 @@ impl GuiApp {
 
     fn handle_cursor_move(&mut self, position: PhysicalPosition<f64>) {
         self.cursor_position = Some(position);
+        let cell = self.point_to_cell(position);
+        let modes = self.active_terminal_modes();
+
+        if should_capture_mouse(modes) {
+            if let Some(cell) = cell {
+                if let Some(bytes) =
+                    encode_mouse_motion(self.pressed_mouse_button, cell, self.modifiers, modes)
+                {
+                    if let Some(tab) = self.active_tab_mut() {
+                        let _ = tab.send_input(&bytes);
+                    }
+                }
+            }
+            return;
+        }
+
         if !self.selecting {
             return;
         }
-        let cell = self.point_to_cell(position);
         if let (Some(tab), Some(cell)) = (self.active_tab_mut(), cell) {
             tab.update_selection(cell);
         }
@@ -305,8 +352,23 @@ impl GuiApp {
             MouseScrollDelta::LineDelta(_, y) => y.round() as i32,
             MouseScrollDelta::PixelDelta(position) => (position.y / 20.0).round() as i32,
         };
+        if lines == 0 {
+            return;
+        }
 
-        if let Some(tab) = self.active_tab_mut() {
+        let modes = self.active_terminal_modes();
+        let point = self
+            .cursor_position
+            .and_then(|position| self.point_to_cell(position));
+        let modifiers = self.modifiers;
+
+        if should_capture_mouse(modes) {
+            if let (Some(cell), Some(tab)) = (point, self.active_tab_mut()) {
+                for packet in encode_mouse_wheel(lines, cell, modifiers, modes) {
+                    let _ = tab.send_input(&packet);
+                }
+            }
+        } else if let Some(tab) = self.active_tab_mut() {
             tab.scroll(lines);
         }
     }
@@ -409,7 +471,7 @@ impl GuiApp {
     fn paste_from_clipboard(&mut self) {
         match self.clipboard.get_text() {
             Ok(Some(text)) if !text.is_empty() => {
-                let payload = normalize_paste(&text);
+                let payload = normalize_paste(&text, self.active_terminal_modes());
                 if let Some(tab) = self.active_tab_mut() {
                     let _ = tab.send_input(&payload);
                     tab.clear_selection();
