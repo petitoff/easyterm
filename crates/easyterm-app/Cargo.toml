@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ab_glyph = "0.2"
 easyterm-core = { path = "../easyterm-core" }
 easyterm-remote = { path = "../easyterm-remote" }
 easyterm-render = { path = "../easyterm-render" }

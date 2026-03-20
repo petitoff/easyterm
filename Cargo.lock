@@ -349,6 +349,7 @@ dependencies = [
 name = "easyterm-app"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "easyterm-core",
  "easyterm-remote",
  "easyterm-render",

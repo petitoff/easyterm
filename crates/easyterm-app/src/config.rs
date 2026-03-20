@@ -213,7 +213,7 @@ fn default_font_family() -> String {
 }
 
 fn default_font_size() -> u16 {
-    13
+    16
 }
 
 fn default_shell_program() -> String {

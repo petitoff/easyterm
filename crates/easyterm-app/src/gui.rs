@@ -1,13 +1,18 @@
 use crate::config::AppConfig;
 use crate::pty::{spawn_local_runtime, LocalPtyError, PtyRuntime, PtySize};
 use crate::session::LocalSessionSpec;
+use ab_glyph::{point, Font, FontArc, Glyph, PxScale, ScaleFont};
 use easyterm_core::{Cell, Color, Cursor, Terminal};
 use font8x8::{UnicodeFonts, BASIC_FONTS};
 use softbuffer::{Context, Surface};
+use std::cell::RefCell;
 use std::cmp::{max, min};
+use std::collections::HashMap;
 use std::error::Error;
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -18,6 +23,8 @@ use winit::window::{Window, WindowId};
 const TAB_PADDING_X: usize = 12;
 const TAB_GAP: usize = 8;
 const TAB_MIN_WIDTH: usize = 120;
+const CURSOR_BLINK_ON: Duration = Duration::from_millis(550);
+const CURSOR_BLINK_OFF: Duration = Duration::from_millis(450);
 
 pub fn run_gui(config: AppConfig) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
@@ -39,11 +46,12 @@ struct GuiApp {
     cursor_position: Option<PhysicalPosition<f64>>,
     selecting: bool,
     last_error: Option<String>,
+    cursor_blink_epoch: Instant,
 }
 
 impl GuiApp {
     fn new(config: AppConfig) -> Self {
-        let renderer = RendererState::new(config.font.size);
+        let renderer = RendererState::new(config.font.size, &config.font.family);
         Self {
             config,
             window: None,
@@ -56,6 +64,7 @@ impl GuiApp {
             cursor_position: None,
             selecting: false,
             last_error: None,
+            cursor_blink_epoch: Instant::now(),
         }
     }
 
@@ -155,10 +164,12 @@ impl GuiApp {
             match &event.logical_key {
                 Key::Character(value) if value.eq_ignore_ascii_case("t") => {
                     let _ = self.open_tab(self.default_shell_spec(), self.current_terminal_size());
+                    self.reset_cursor_blink();
                     return;
                 }
                 Key::Character(value) if value.eq_ignore_ascii_case("w") => {
                     self.close_active_tab(event_loop);
+                    self.reset_cursor_blink();
                     return;
                 }
                 _ => {}
@@ -172,6 +183,7 @@ impl GuiApp {
                 if let Some(tab) = self.active_tab_mut() {
                     let _ = tab.send_input(&bytes);
                 }
+                self.reset_cursor_blink();
                 return;
             }
         }
@@ -180,6 +192,7 @@ impl GuiApp {
             if let Some(tab) = self.active_tab_mut() {
                 let _ = tab.send_input(bytes);
             }
+            self.reset_cursor_blink();
             return;
         }
 
@@ -188,6 +201,7 @@ impl GuiApp {
                 if let Some(tab) = self.active_tab_mut() {
                     let _ = tab.send_input(text.as_bytes());
                 }
+                self.reset_cursor_blink();
             }
         }
     }
@@ -214,6 +228,7 @@ impl GuiApp {
         if let Some(tab) = self.active_tab_mut() {
             let _ = tab.send_input(text.as_bytes());
         }
+        self.reset_cursor_blink();
     }
 
     fn handle_mouse_input(
@@ -233,6 +248,7 @@ impl GuiApp {
         if let Some(index) = self.tab_index_at(position.x as usize, position.y as usize) {
             if state == ElementState::Pressed {
                 self.active_tab = index;
+                self.reset_cursor_blink();
             }
             return;
         }
@@ -296,15 +312,11 @@ impl GuiApp {
         let Some(window) = self.window.as_ref() else {
             return Ok(());
         };
+        let cursor_visible = self.cursor_visible();
         let Some(surface) = self.surface.as_mut() else {
             return Ok(());
         };
         let size = window.inner_size();
-
-        for tab in &mut self.tabs {
-            tab.drain_output();
-            let _ = tab.refresh_exit_state();
-        }
 
         let mut buffer = surface.buffer_mut()?;
         let mut canvas = Canvas::new(&mut buffer, size.width as usize, size.height as usize);
@@ -313,9 +325,51 @@ impl GuiApp {
             &self.tabs,
             self.active_tab,
             self.last_error.as_deref(),
+            cursor_visible,
         );
         buffer.present()?;
         Ok(())
+    }
+
+    fn poll_tabs(&mut self) -> bool {
+        for tab in &mut self.tabs {
+            tab.drain_output();
+            let _ = tab.refresh_exit_state();
+        }
+
+        let mut removed_before_active = 0usize;
+        let mut index = self.tabs.len();
+        while index > 0 {
+            index -= 1;
+            if self.tabs[index].exit_status.is_some() {
+                let mut tab = self.tabs.remove(index);
+                let _ = tab.shutdown();
+                if index < self.active_tab {
+                    removed_before_active += 1;
+                }
+            }
+        }
+
+        if self.tabs.is_empty() {
+            self.active_tab = 0;
+            return true;
+        }
+
+        self.active_tab = self
+            .active_tab
+            .saturating_sub(removed_before_active)
+            .min(self.tabs.len() - 1);
+        false
+    }
+
+    fn cursor_visible(&self) -> bool {
+        let cycle = CURSOR_BLINK_ON + CURSOR_BLINK_OFF;
+        let elapsed = self.cursor_blink_epoch.elapsed();
+        elapsed.as_millis() % cycle.as_millis() < CURSOR_BLINK_ON.as_millis()
+    }
+
+    fn reset_cursor_blink(&mut self) {
+        self.cursor_blink_epoch = Instant::now();
     }
 }
 
@@ -337,6 +391,10 @@ impl ApplicationHandler for GuiApp {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => self.on_resize(size),
             WindowEvent::RedrawRequested => {
+                if self.poll_tabs() {
+                    event_loop.exit();
+                    return;
+                }
                 if let Err(err) = self.draw() {
                     self.last_error = Some(err.to_string());
                     event_loop.exit();
@@ -493,20 +551,26 @@ struct CellPoint {
 }
 
 struct RendererState {
-    glyph_scale: usize,
+    font: FontBackend,
     cell_width: usize,
     cell_height: usize,
     tab_height: usize,
 }
 
 impl RendererState {
-    fn new(font_size: u16) -> Self {
-        let glyph_scale = max(1, ((font_size as usize) + 7) / 8);
-        let cell_width = 8 * glyph_scale;
-        let cell_height = 10 * glyph_scale;
+    fn new(font_size: u16, family: &str) -> Self {
+        let font = load_outline_font(family, font_size).unwrap_or_else(|| {
+            let glyph_scale = max(1, ((font_size as usize) + 7) / 8);
+            FontBackend::Bitmap { glyph_scale }
+        });
+
+        let (cell_width, cell_height) = match &font {
+            FontBackend::Outline(outline) => (outline.cell_width, outline.cell_height),
+            FontBackend::Bitmap { glyph_scale } => (8 * glyph_scale, 10 * glyph_scale),
+        };
         let tab_height = cell_height + 10;
         Self {
-            glyph_scale,
+            font,
             cell_width,
             cell_height,
             tab_height,
@@ -528,7 +592,7 @@ impl RendererState {
         let mut layouts = Vec::new();
 
         for (index, tab) in tabs.iter().enumerate() {
-            let text_width = tab.title.chars().count() * self.cell_width / 2;
+            let text_width = self.measure_text(&tab.title);
             let width = max(TAB_MIN_WIDTH, text_width + TAB_PADDING_X * 2);
             if x >= width_limit {
                 break;
@@ -562,17 +626,18 @@ impl RendererState {
     }
 
     fn render(
-        &self,
+        &mut self,
         canvas: &mut Canvas<'_>,
         tabs: &[GuiTab],
         active_tab: usize,
         error: Option<&str>,
+        cursor_visible: bool,
     ) {
         canvas.clear(rgb(14, 16, 20));
         self.render_tab_bar(canvas, tabs, active_tab);
 
         if let Some(tab) = tabs.get(active_tab) {
-            self.render_terminal(canvas, tab);
+            self.render_terminal(canvas, tab, cursor_visible);
         }
 
         if let Some(message) = error {
@@ -594,7 +659,7 @@ impl RendererState {
         }
     }
 
-    fn render_tab_bar(&self, canvas: &mut Canvas<'_>, tabs: &[GuiTab], active_tab: usize) {
+    fn render_tab_bar(&mut self, canvas: &mut Canvas<'_>, tabs: &[GuiTab], active_tab: usize) {
         canvas.fill_rect(0, 0, canvas.width, self.tab_height, rgb(24, 26, 32));
 
         for layout in self.layout_tabs(
@@ -617,7 +682,7 @@ impl RendererState {
             self.draw_text(
                 canvas,
                 layout.x + TAB_PADDING_X,
-                8,
+                7,
                 &tabs[layout.index].title,
                 rgb(224, 229, 236),
                 None,
@@ -625,7 +690,7 @@ impl RendererState {
         }
     }
 
-    fn render_terminal(&self, canvas: &mut Canvas<'_>, tab: &GuiTab) {
+    fn render_terminal(&mut self, canvas: &mut Canvas<'_>, tab: &GuiTab, cursor_visible: bool) {
         let cols = tab.terminal.grid().width();
         let rows = tab.terminal.grid().height();
         let viewport_start = tab.viewport_start(rows);
@@ -662,21 +727,23 @@ impl RendererState {
 
                 canvas.fill_rect(x, y, self.cell_width, self.cell_height, bg);
                 if ch != ' ' {
-                    self.draw_char(canvas, x, y + self.glyph_scale, ch, fg, Some(bg));
+                    self.draw_char(canvas, x, y, ch, fg, Some(bg));
                 }
                 if underline {
                     canvas.fill_rect(
                         x,
-                        y + self.cell_height.saturating_sub(max(1, self.glyph_scale)),
+                        y + self
+                            .cell_height
+                            .saturating_sub(max(1, self.underline_thickness())),
                         self.cell_width,
-                        max(1, self.glyph_scale),
+                        max(1, self.underline_thickness()),
                         fg,
                     );
                 }
             }
         }
 
-        if tab.scroll_offset == 0 {
+        if cursor_visible && tab.scroll_offset == 0 {
             self.render_cursor(
                 canvas,
                 tab.terminal.cursor(),
@@ -698,7 +765,7 @@ impl RendererState {
     }
 
     fn draw_text(
-        &self,
+        &mut self,
         canvas: &mut Canvas<'_>,
         x: usize,
         y: usize,
@@ -709,12 +776,12 @@ impl RendererState {
         let mut pen_x = x;
         for ch in text.chars() {
             self.draw_char(canvas, pen_x, y, ch, fg, bg);
-            pen_x += self.cell_width / 2;
+            pen_x += self.text_step(ch);
         }
     }
 
     fn draw_char(
-        &self,
+        &mut self,
         canvas: &mut Canvas<'_>,
         x: usize,
         y: usize,
@@ -722,23 +789,64 @@ impl RendererState {
         fg: u32,
         bg: Option<u32>,
     ) {
-        let bitmap = BASIC_FONTS.get(ch).or_else(|| BASIC_FONTS.get('?'));
-        if let Some(bg) = bg {
-            canvas.fill_rect(x, y, 8 * self.glyph_scale, 8 * self.glyph_scale, bg);
-        }
-        let Some(bitmap) = bitmap else {
-            return;
-        };
-
-        for (row, bits) in bitmap.iter().copied().enumerate() {
-            for col in 0..8 {
-                if bits & (1 << col) == 0 {
-                    continue;
+        match &self.font {
+            FontBackend::Outline(outline) => {
+                let Some(glyph) = outline.rasterized(ch) else {
+                    return;
+                };
+                if let Some(bg) = bg {
+                    canvas.fill_rect(x, y, self.cell_width, self.cell_height, bg);
                 }
-                let px = x + col as usize * self.glyph_scale;
-                let py = y + row * self.glyph_scale;
-                canvas.fill_rect(px, py, self.glyph_scale, self.glyph_scale, fg);
+                for py in 0..glyph.height {
+                    for px in 0..glyph.width {
+                        let alpha = glyph.pixels[py * glyph.width + px];
+                        if alpha == 0 {
+                            continue;
+                        }
+                        let target_x = x as isize + glyph.offset_x + px as isize;
+                        let target_y = y as isize + glyph.offset_y + py as isize;
+                        canvas.blend_pixel(target_x, target_y, fg, alpha);
+                    }
+                }
             }
+            FontBackend::Bitmap { glyph_scale } => {
+                let bitmap = BASIC_FONTS.get(ch).or_else(|| BASIC_FONTS.get('?'));
+                if let Some(bg) = bg {
+                    canvas.fill_rect(x, y, 8 * glyph_scale, 8 * glyph_scale, bg);
+                }
+                let Some(bitmap) = bitmap else {
+                    return;
+                };
+
+                for (row, bits) in bitmap.iter().copied().enumerate() {
+                    for col in 0..8 {
+                        if bits & (1 << col) == 0 {
+                            continue;
+                        }
+                        let px = x + col as usize * glyph_scale;
+                        let py = y + row * glyph_scale;
+                        canvas.fill_rect(px, py, *glyph_scale, *glyph_scale, fg);
+                    }
+                }
+            }
+        }
+    }
+
+    fn text_step(&self, ch: char) -> usize {
+        match &self.font {
+            FontBackend::Outline(outline) => outline.advance(ch),
+            FontBackend::Bitmap { .. } => self.cell_width / 2,
+        }
+    }
+
+    fn measure_text(&self, text: &str) -> usize {
+        text.chars().map(|ch| self.text_step(ch)).sum()
+    }
+
+    fn underline_thickness(&self) -> usize {
+        match &self.font {
+            FontBackend::Outline(outline) => max(1, outline.cell_height / 14),
+            FontBackend::Bitmap { glyph_scale } => max(1, *glyph_scale),
         }
     }
 }
@@ -784,6 +892,15 @@ impl<'a> Canvas<'a> {
         self.fill_rect(x, y + height, width, 1, color);
         self.fill_rect(x, y, 1, height, color);
         self.fill_rect(x + width, y, 1, height + 1, color);
+    }
+
+    fn blend_pixel(&mut self, x: isize, y: isize, fg: u32, alpha: u8) {
+        if x < 0 || y < 0 || x as usize >= self.width || y as usize >= self.height {
+            return;
+        }
+        let idx = y as usize * self.width + x as usize;
+        let bg = self.buffer[idx];
+        self.buffer[idx] = blend_colors(bg, fg, alpha);
     }
 }
 
@@ -863,6 +980,167 @@ fn component_6cube(value: u8) -> u8 {
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
+
+fn blend_colors(bg: u32, fg: u32, alpha: u8) -> u32 {
+    let alpha = alpha as u32;
+    let inv = 255 - alpha;
+    let bg_r = (bg >> 16) & 0xff;
+    let bg_g = (bg >> 8) & 0xff;
+    let bg_b = bg & 0xff;
+    let fg_r = (fg >> 16) & 0xff;
+    let fg_g = (fg >> 8) & 0xff;
+    let fg_b = fg & 0xff;
+
+    let r = (fg_r * alpha + bg_r * inv) / 255;
+    let g = (fg_g * alpha + bg_g * inv) / 255;
+    let b = (fg_b * alpha + bg_b * inv) / 255;
+    (r << 16) | (g << 8) | b
+}
+
+enum FontBackend {
+    Outline(OutlineFont),
+    Bitmap { glyph_scale: usize },
+}
+
+struct OutlineFont {
+    font: FontArc,
+    scale: PxScale,
+    baseline: f32,
+    cell_width: usize,
+    cell_height: usize,
+    cache: RefCell<HashMap<char, RasterizedGlyph>>,
+}
+
+impl OutlineFont {
+    fn new(font: FontArc, size: u16) -> Self {
+        let scale = PxScale::from(size as f32 * 1.2);
+        let scaled = font.as_scaled(scale);
+        let baseline = scaled.ascent().ceil();
+        let descent = scaled.descent().abs().ceil();
+        let line_gap = scaled.line_gap().ceil();
+        let cell_width = scaled
+            .h_advance(font.glyph_id('M'))
+            .max(scaled.h_advance(font.glyph_id('W')))
+            .ceil() as usize
+            + 2;
+        let cell_height = (baseline + descent + line_gap).ceil() as usize + 2;
+
+        Self {
+            font,
+            scale,
+            baseline,
+            cell_width,
+            cell_height,
+            cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn advance(&self, ch: char) -> usize {
+        let scaled = self.font.as_scaled(self.scale);
+        let id = self.font.glyph_id(ch);
+        max(1, scaled.h_advance(id).ceil() as usize)
+    }
+
+    fn rasterized(&self, ch: char) -> Option<RasterizedGlyph> {
+        if let Some(cached) = self.cache.borrow().get(&ch).cloned() {
+            return Some(cached);
+        }
+
+        let glyph = self.rasterize_char(ch)?;
+        self.cache.borrow_mut().insert(ch, glyph.clone());
+        Some(glyph)
+    }
+
+    fn rasterize_char(&self, ch: char) -> Option<RasterizedGlyph> {
+        let glyph = Glyph {
+            id: self.font.glyph_id(ch),
+            scale: self.scale,
+            position: point(0.0, self.baseline),
+        };
+        let outlined = self.font.outline_glyph(glyph).or_else(|| {
+            self.font.outline_glyph(Glyph {
+                id: self.font.glyph_id('?'),
+                scale: self.scale,
+                position: point(0.0, self.baseline),
+            })
+        })?;
+
+        let bounds = outlined.px_bounds();
+        let width = (bounds.max.x - bounds.min.x).max(0.0).ceil() as usize;
+        let height = (bounds.max.y - bounds.min.y).max(0.0).ceil() as usize;
+        let mut pixels = vec![0_u8; width.saturating_mul(height)];
+        if width > 0 && height > 0 {
+            outlined.draw(|x, y, coverage| {
+                let idx = y as usize * width + x as usize;
+                pixels[idx] = (coverage * 255.0) as u8;
+            });
+        }
+
+        Some(RasterizedGlyph {
+            width,
+            height,
+            offset_x: bounds.min.x.floor() as isize + 1,
+            offset_y: bounds.min.y.floor() as isize + 1,
+            pixels,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct RasterizedGlyph {
+    width: usize,
+    height: usize,
+    offset_x: isize,
+    offset_y: isize,
+    pixels: Vec<u8>,
+}
+
+fn load_outline_font(family: &str, size: u16) -> Option<FontBackend> {
+    for path in font_candidates(family) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            if let Ok(font) = FontArc::try_from_vec(bytes) {
+                return Some(FontBackend::Outline(OutlineFont::new(font, size)));
+            }
+        }
+    }
+
+    None
+}
+
+fn font_candidates(family: &str) -> Vec<PathBuf> {
+    let family_lower = family.to_ascii_lowercase();
+    let mut paths = Vec::new();
+
+    if family_lower.contains("iosevka") {
+        paths.extend([
+            "/usr/share/fonts/truetype/iosevka/IosevkaTerm-Regular.ttf",
+            "/usr/share/fonts/TTF/IosevkaTerm-Regular.ttf",
+            "/usr/local/share/fonts/IosevkaTerm-Regular.ttf",
+        ]);
+    }
+    if family_lower.contains("noto") {
+        paths.push("/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf");
+    }
+    if family_lower.contains("dejavu") {
+        paths.push("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf");
+    }
+    if family_lower.contains("liberation") {
+        paths.push("/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf");
+    }
+
+    paths.extend([
+        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeMono.ttf",
+    ]);
+
+    paths
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| Path::new(path).exists())
+        .collect()
 }
 
 fn named_key_bytes(key: &Key) -> Option<&'static [u8]> {
