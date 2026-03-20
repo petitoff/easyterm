@@ -1,0 +1,9 @@
+[package]
+name = "easyterm-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+easyterm-core = { path = "../easyterm-core" }
+serde.workspace = true

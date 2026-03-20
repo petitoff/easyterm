@@ -1,0 +1,16 @@
+[package]
+name = "easyterm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+easyterm-core = { path = "../easyterm-core" }
+easyterm-remote = { path = "../easyterm-remote" }
+easyterm-render = { path = "../easyterm-render" }
+font8x8 = "0.3"
+libc.workspace = true
+serde.workspace = true
+softbuffer = "0.4"
+toml.workspace = true
+winit = "0.30"
