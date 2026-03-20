@@ -49,6 +49,7 @@ pub enum AnsiEvent {
     ClearLine(ClearMode),
     ClearScreen(ClearMode),
     SetStyle(Vec<u16>),
+    SetWindowTitle(String),
 }
 
 pub fn parse_ansi(input: &[u8]) -> Vec<AnsiEvent> {
@@ -90,7 +91,14 @@ pub fn parse_ansi(input: &[u8]) -> Vec<AnsiEvent> {
                         break;
                     }
                 } else if i + 1 < input.len() && input[i + 1] == b']' {
-                    i = skip_osc_sequence(input, i + 2);
+                    if let Some((event, next_i)) = parse_osc_sequence(input, i + 2) {
+                        if let Some(event) = event {
+                            events.push(event);
+                        }
+                        i = next_i;
+                    } else {
+                        break;
+                    }
                 } else {
                     i += 1;
                 }
@@ -180,15 +188,32 @@ fn decode_utf8_char(bytes: &[u8]) -> Option<char> {
     None
 }
 
-fn skip_osc_sequence(input: &[u8], mut i: usize) -> usize {
-    while i < input.len() {
-        match input[i] {
-            0x07 => return i + 1,
-            0x1b if i + 1 < input.len() && input[i + 1] == b'\\' => return i + 2,
-            _ => i += 1,
+fn parse_osc_sequence(input: &[u8], start: usize) -> Option<(Option<AnsiEvent>, usize)> {
+    let mut end = start;
+    while end < input.len() {
+        match input[end] {
+            0x07 => break,
+            0x1b if end + 1 < input.len() && input[end + 1] == b'\\' => break,
+            _ => end += 1,
         }
     }
-    input.len()
+
+    if end >= input.len() {
+        return None;
+    }
+
+    let next_i = if input[end] == 0x07 { end + 1 } else { end + 2 };
+    let payload = std::str::from_utf8(&input[start..end]).ok()?;
+    let mut parts = payload.splitn(2, ';');
+    let code = parts.next().unwrap_or_default();
+    let value = parts.next().unwrap_or_default();
+
+    let event = match code {
+        "0" | "2" if !value.is_empty() => Some(AnsiEvent::SetWindowTitle(value.to_string())),
+        _ => None,
+    };
+
+    Some((event, next_i))
 }
 
 #[cfg(test)]
@@ -229,6 +254,7 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                AnsiEvent::SetWindowTitle("easyterm".into()),
                 AnsiEvent::Print('h'),
                 AnsiEvent::Print('e'),
                 AnsiEvent::Print('l'),
@@ -236,6 +262,12 @@ mod tests {
                 AnsiEvent::Print('o'),
             ]
         );
+    }
+
+    #[test]
+    fn parses_osc_title_with_st_terminator() {
+        let events = parse_ansi(b"\x1b]2;build:api\x1b\\");
+        assert_eq!(events, vec![AnsiEvent::SetWindowTitle("build:api".into())]);
     }
 
     #[test]

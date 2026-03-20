@@ -7,6 +7,7 @@ pub struct Terminal {
     cursor: Cursor,
     active_style: Style,
     scrollback: Vec<String>,
+    window_title: String,
     pending_wrap: bool,
 }
 
@@ -17,6 +18,7 @@ impl Terminal {
             cursor: Cursor { row: 0, col: 0 },
             active_style: Style::default(),
             scrollback: Vec::new(),
+            window_title: String::new(),
             pending_wrap: false,
         }
     }
@@ -35,6 +37,10 @@ impl Terminal {
 
     pub fn scrollback(&self) -> &[String] {
         &self.scrollback
+    }
+
+    pub fn window_title(&self) -> &str {
+        &self.window_title
     }
 
     pub fn resize(&mut self, width: usize, height: usize) {
@@ -91,6 +97,7 @@ impl Terminal {
             AnsiEvent::ClearLine(mode) => self.clear_line(mode),
             AnsiEvent::ClearScreen(mode) => self.clear_screen(mode),
             AnsiEvent::SetStyle(params) => self.apply_sgr(&params),
+            AnsiEvent::SetWindowTitle(title) => self.window_title = title,
         }
     }
 
@@ -321,5 +328,13 @@ mod tests {
 
         assert_eq!(terminal.scrollback(), &["one", "two"]);
         assert_eq!(terminal.visible_lines(), vec!["thr", "ee"]);
+    }
+
+    #[test]
+    fn stores_window_title_from_osc() {
+        let mut terminal = Terminal::new(8, 2);
+        terminal.feed(b"\x1b]0;user@host: ~/repo\x07");
+
+        assert_eq!(terminal.window_title(), "user@host: ~/repo");
     }
 }
